@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-AntiCoding Agent - Local AI Pair-Programmer powered by llama.service (Qwen3-Coder-Next-Q8_0)
+AntiCoding Agent - Autonomous AI Pair-Programmer for OpenAI-Compatible APIs
 Zero external dependencies required (100% Python 3 standard library).
+Compatible with OpenAI API, llama.cpp (llama-server), Ollama, vLLM, DeepSeek, and OpenRouter.
+
 Features:
 - Real-time Token Streaming (SSE over urllib.request)
 - Thinking / Reasoning Highlighting (<think> tags & reasoning_content)
-- Automatic Git Checkpoints (Non-destructive rollback / undo)
+- Unified Diff Previews (ANSI colored + / - diffs via stdlib difflib)
+- Isolated Git Worktree Workspaces (/ws new, /ws switch, /ws apply)
+- Automatic Git Checkpoints (Non-destructive patch snapshots & rollback)
 - Deep History Recovery (JSONL Session Transcript Journal + search_session_history tool)
-- Hybrid Memory Architecture: Living Disk Artifacts (.anticoding/scratchpad.md) + Turn-Boundary Compaction.
+- Hybrid Memory Architecture: Living Disk Artifacts (.anticoding/scratchpad.md) + Turn-Boundary Compaction
+- Interactive REPL + Headless One-Shot CLI (-p / --prompt & stdin pipe support)
 """
 
 import os
@@ -15,12 +20,16 @@ import sys
 import json
 import re
 import time
+import difflib
+import argparse
 import subprocess
 import urllib.request
 import urllib.error
 
+VERSION = "2.1.0"
+
 # ==============================================================================
-# ⚙️ USER CONFIGURATION (Easily customize your local setup or .env file here)
+# ⚙️ USER CONFIGURATION (Customize via .env, environment variables, or CLI flags)
 # ==============================================================================
 def find_repo_root() -> str:
     """Locate the top-level root of the Git repository or fallback to current directory."""
@@ -58,12 +67,26 @@ ROOT_WORKSPACE = find_repo_root()                                  # Main reposi
 load_dotenv(os.path.join(ROOT_WORKSPACE, ".env"))
 load_dotenv(".env")
 
-API_BASE = os.getenv("ANTICODING_API_BASE", "http://127.0.0.1:8081/v1")
-API_KEY = os.getenv("ANTICODING_API_KEY", "sk-no-key-required")
-MODEL_NAME = os.getenv("ANTICODING_MODEL", "Qwen3-Coder-Next-Q8_0")
+# Supports both ANTICODING_* and standard OPENAI_* environment variables
+API_BASE = (
+    os.getenv("ANTICODING_API_BASE")
+    or os.getenv("OPENAI_BASE_URL")
+    or os.getenv("OPENAI_API_BASE")
+    or "http://127.0.0.1:8081/v1"
+).rstrip("/")
+API_KEY = (
+    os.getenv("ANTICODING_API_KEY")
+    or os.getenv("OPENAI_API_KEY")
+    or "sk-no-key-required"
+)
+MODEL_NAME = (
+    os.getenv("ANTICODING_MODEL")
+    or os.getenv("OPENAI_MODEL")
+    or "Qwen3-Coder-Next-Q8_0"
+)
 
-# Context & Memory Limits (Configured for 128k / 131,072 context size)
-SERVER_CTX_SIZE = int(os.getenv("ANTICODING_CTX_SIZE", "131072"))  # Server's --ctx-size
+# Context & Memory Limits (Configured for 128k / 131,072 context size by default)
+SERVER_CTX_SIZE = int(os.getenv("ANTICODING_CTX_SIZE", "131072"))  # Server's context window size
 MAX_CONTEXT_TOKENS = int(os.getenv("ANTICODING_MAX_TOKENS", str(int(SERVER_CTX_SIZE * 0.75)))) # Default: 98,304 tokens
 MAX_READ_CHARS = 160000                                            # Max characters per read_file (~3,500–4,000 lines)
 MAX_CMD_CHARS = 60000                                              # Max characters returned per command run (~1,200 lines)
@@ -71,6 +94,7 @@ RECENT_MESSAGES_TO_KEEP = int(os.getenv("ANTICODING_RECENT_MSGS", "14")) # Prese
 ENABLE_STREAMING = True                                            # Real-time word-by-word streaming
 ENABLE_REPO_MAP = True                                             # Inject real-time repo symbol map into System Prompt
 ENABLE_SANDBOX = True                                              # Enforce filesystem path jail & dangerous command filters
+ASK_BEFORE_EXEC = os.getenv("ANTICODING_CONFIRM", "auto").lower() == "ask" # Prompt user before shell commands
 
 # Persistent Storage Paths & Workspaces
 CURRENT_WORKSPACE = ROOT_WORKSPACE                                # Active workspace directory (root or worktree)
@@ -82,7 +106,7 @@ SESSION_ID = time.strftime("%Y%m%d_%H%M%S")
 TRANSCRIPT_FILE = os.path.join(TRANSCRIPTS_DIR, f"session_{SESSION_ID}.jsonl")
 # ==============================================================================
 
-SYSTEM_PROMPT = """You are AntiCoding Agent, an autonomous local AI pair-programming assistant.
+SYSTEM_PROMPT = """You are AntiCoding Agent, an autonomous AI pair-programming assistant.
 You have access to powerful tools to inspect codebases, execute shell commands, read/write files, and perform surgical code edits.
 
 Operating Principles:
@@ -333,7 +357,7 @@ def create_checkpoint(label: str = "", workspace: str = None) -> str:
         return None
 
 def rollback_checkpoint(workspace: str = None) -> str:
-    """Roll back workspace changes to the previous checkpoint."""
+    """Roll back workspace changes to the exact state captured in the previous checkpoint patch."""
     target_ws = workspace or CURRENT_WORKSPACE
     if not is_git_repo(target_ws):
         return "Not a git repository. Cannot rollback."
@@ -347,11 +371,26 @@ def rollback_checkpoint(workspace: str = None) -> str:
         latest_patch = patches[-1]
         patch_path = os.path.join(CHECKPOINTS_DIR, latest_patch)
         
+        # 1. Reset working tree to clean HEAD
         subprocess.run(["git", "checkout", "."], cwd=target_ws, capture_output=True, text=True, timeout=10)
         subprocess.run(["git", "clean", "-fd"], cwd=target_ws, capture_output=True, text=True, timeout=10)
         
+        # 2. Re-apply the diff patch captured at the start of the turn (if non-empty)
+        with open(patch_path, "r", encoding="utf-8") as f:
+            patch_lines = [line for line in f if not line.startswith("# ")]
+        patch_body = "".join(patch_lines)
+        if patch_body.strip():
+            subprocess.run(
+                ["git", "apply", "--whitespace=nowarn", "-"],
+                input=patch_body,
+                cwd=target_ws,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+        
         os.remove(patch_path)
-        return f"Successfully rolled back workspace ({target_ws}) to before checkpoint '{latest_patch}'."
+        return f"Successfully restored workspace ({target_ws}) to checkpoint '{latest_patch}'."
     except Exception as e:
         return f"Rollback Error: {str(e)}"
 
@@ -365,7 +404,7 @@ def list_checkpoints(workspace: str = None) -> str:
     patches = sorted([p for p in os.listdir(CHECKPOINTS_DIR) if p.endswith(".patch")])
     if not patches:
         return "No checkpoints saved yet."
-    return f"Saved Checkpoints (newest last):\n" + "\n".join(f"  • {p}" for p in patches[-10:])
+    return "Saved Checkpoints (newest last):\n" + "\n".join(f"  • {p}" for p in patches[-10:])
 
 # ----------------- Sandboxing & Workspaces Engine -----------------
 
@@ -524,13 +563,54 @@ def discard_workspace(name: str) -> str:
     
     return f"Successfully discarded workspace '{name}' and deleted branch."
 
-# ----------------- Tool Implementations -----------------
+# ----------------- Diff Renderer & Tool Implementations -----------------
+
+def print_color_diff(old_text: str, new_text: str, path: str, max_lines: int = 40):
+    """Render a compact ANSI-colored unified diff in the terminal using stdlib difflib."""
+    diff = list(difflib.unified_diff(
+        old_text.splitlines(),
+        new_text.splitlines(),
+        fromfile=f"a/{os.path.basename(path)}",
+        tofile=f"b/{os.path.basename(path)}",
+        lineterm=""
+    ))
+    if not diff:
+        return
+    print(f"\n\033[96m[Diff Preview: {os.path.basename(path)}]\033[0m")
+    for line in diff[:max_lines]:
+        if line.startswith("+") and not line.startswith("+++"):
+            print(f"\033[92m{line}\033[0m")
+        elif line.startswith("-") and not line.startswith("---"):
+            print(f"\033[91m{line}\033[0m")
+        elif line.startswith("@@"):
+            print(f"\033[96m{line}\033[0m")
+        else:
+            print(f"\033[90m{line}\033[0m")
+    if len(diff) > max_lines:
+        print(f"\033[90m... ({len(diff) - max_lines} more diff lines)\033[0m")
+
+def confirm_action(prompt_label: str) -> bool:
+    """Prompt user for confirmation when ASK_BEFORE_EXEC is enabled."""
+    global ASK_BEFORE_EXEC
+    if not ASK_BEFORE_EXEC or not sys.stdin.isatty():
+        return True
+    try:
+        ans = input(f"\033[93m[Confirm]\033[0m {prompt_label} [Y/n/a(lways)]: ").strip().lower()
+        if ans in ["a", "always"]:
+            ASK_BEFORE_EXEC = False
+            print("\033[92m[Mode] Switched to 'auto' approval mode for this session.\033[0m")
+            return True
+        return ans in ["", "y", "yes"]
+    except (EOFError, KeyboardInterrupt):
+        return False
 
 def tool_run_command(command: str) -> str:
     """Execute shell command with timeout, safety filtering, and active workspace cwd."""
     safe, reason = is_safe_command(command)
     if not safe:
         return f"Error: {reason}"
+    if not confirm_action(f"Execute shell command `{command}`?"):
+        return "Command execution cancelled by user."
     try:
         res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120, cwd=CURRENT_WORKSPACE)
         output = res.stdout + res.stderr
@@ -597,6 +677,11 @@ def tool_replace_file_content(path: str, target: str, replacement: str) -> str:
             return f"Error: Target text occurs {occurrences} times in '{path}'. Please provide more surrounding context to ensure a unique match."
 
         new_content = content.replace(target, replacement, 1)
+        print_color_diff(content, new_content, path)
+
+        if not confirm_action(f"Apply edit to '{os.path.basename(path)}'?"):
+            return "File modification cancelled by user."
+
         with open(path, "w", encoding="utf-8") as f:
             f.write(new_content)
 
@@ -610,6 +695,15 @@ def tool_write_file(path: str, content: str) -> str:
     if not safe:
         return f"Error: {err}"
     try:
+        old_content = ""
+        if os.path.exists(path) and os.path.isfile(path):
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                old_content = f.read()
+        print_color_diff(old_content, content, path)
+
+        if not confirm_action(f"Write {len(content)} chars to '{os.path.basename(path)}'?"):
+            return "File write cancelled by user."
+
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
@@ -658,7 +752,7 @@ def tool_search_files(pattern: str, path: str = ".", case_sensitive: bool = Fals
                                 rel_path = os.path.relpath(file_path, root_dir)
                                 matches.append(f"{rel_path}:{line_no}: {line.strip()[:150]}")
                                 if len(matches) >= max_matches:
-                                     break
+                                    break
                 except Exception:
                     continue
                 if len(matches) >= max_matches:
@@ -835,6 +929,33 @@ class ThinkingStreamRenderer:
 
 # ----------------- Context & API Management -----------------
 
+def extract_fallback_tool_calls(content: str) -> tuple:
+    """Detect <tool_call>{...}</tool_call> blocks emitted by local models when native tool_calls is empty."""
+    if not content or "<tool_call>" not in content:
+        return content, []
+    pattern = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+    extracted = []
+    for idx, match in enumerate(pattern.finditer(content)):
+        try:
+            payload = json.loads(match.group(1))
+            fn_name = payload.get("name")
+            fn_args = payload.get("arguments", {})
+            if fn_name:
+                extracted.append({
+                    "id": f"call_fallback_{int(time.time()*1000)}_{idx}",
+                    "type": "function",
+                    "function": {
+                        "name": fn_name,
+                        "arguments": json.dumps(fn_args, ensure_ascii=False) if isinstance(fn_args, dict) else str(fn_args)
+                    }
+                })
+        except Exception:
+            continue
+    if not extracted:
+        return content, []
+    cleaned_content = pattern.sub("", content).strip() or None
+    return cleaned_content, extracted
+
 def estimate_tokens(messages: list) -> int:
     """Fast approximation: ~4 characters per token."""
     return sum(len(json.dumps(m, ensure_ascii=False)) for m in messages) // 4
@@ -984,7 +1105,7 @@ def generate_repo_map(root_dir=None) -> str:
     return repo_map_result
 
 def call_llm(messages: list, tools: list = TOOLS, stream: bool = ENABLE_STREAMING, max_retries: int = 2, inject_repo_map: bool = True) -> dict:
-    """Call local llama.service OpenAI chat completions API with SSE real-time streaming."""
+    """Call OpenAI-compatible chat completions API with SSE real-time streaming."""
     url = f"{API_BASE}/chat/completions"
     
     payload_messages = list(messages)
@@ -1014,7 +1135,13 @@ def call_llm(messages: list, tools: list = TOOLS, stream: bool = ENABLE_STREAMIN
             with urllib.request.urlopen(req, timeout=180) as resp:
                 if not stream:
                     data = json.loads(resp.read().decode("utf-8"))
-                    return data["choices"][0]["message"]
+                    msg = data["choices"][0]["message"]
+                    if not msg.get("tool_calls") and msg.get("content"):
+                        cleaned, fallback_tcs = extract_fallback_tool_calls(msg["content"])
+                        if fallback_tcs:
+                            msg["content"] = cleaned
+                            msg["tool_calls"] = fallback_tcs
+                    return msg
 
                 # SSE Streaming Mode
                 renderer = ThinkingStreamRenderer()
@@ -1074,6 +1201,11 @@ def call_llm(messages: list, tools: list = TOOLS, stream: bool = ENABLE_STREAMIN
                     message["tool_calls"] = list(tool_calls_acc.values())
                     if "content" not in message:
                         message["content"] = None
+                elif message.get("content"):
+                    cleaned, fallback_tcs = extract_fallback_tool_calls(message["content"])
+                    if fallback_tcs:
+                        message["content"] = cleaned
+                        message["tool_calls"] = fallback_tcs
 
                 return message
 
@@ -1089,13 +1221,14 @@ def call_llm(messages: list, tools: list = TOOLS, stream: bool = ENABLE_STREAMIN
 
     return None
 
-# ----------------- Interactive Main Loop -----------------
+# ----------------- Turn Execution & Interactive Main Loop -----------------
 
 def print_help():
     print("""
 \033[96mAvailable Commands:\033[0m
   /help                         - Show this help menu
   /clear                        - Clear current conversation history
+  /mode [auto|ask]              - Toggle confirmation mode (auto-execute vs ask before shell/file edits)
   /ws                           - List all git worktree workspaces & active status
   /ws new <name>                - Create & switch to a new isolated worktree workspace
   /ws switch <name|main>        - Switch active workspace to a worktree or root
@@ -1105,31 +1238,131 @@ def print_help():
   /history [query]              - Search raw session transcript journal
   /transcript                   - View path and stats of session transcript file
   /checkpoints                  - List saved git snapshots
-  /rollback                     - Undo changes and roll back to previous checkpoint
+  /rollback                     - Undo changes and restore previous checkpoint patch
   /compact                      - Manually trigger conversation compaction
   exit / quit                   - Terminate the agent session
 """)
 
-def run_agent():
+def run_turn(user_input: str, messages: list) -> bool:
+    """Execute a single user prompt turn (including multi-step tool loop)."""
+    create_checkpoint(user_input)
+
+    user_msg = {"role": "user", "content": user_input}
+    messages.append(user_msg)
+    log_transcript_entry(user_msg)
+
+    step_count = 0
+    max_steps = 25
+
+    while step_count < max_steps:
+        step_count += 1
+        messages[:] = compact_conversation(messages)
+
+        response = call_llm(messages)
+        if not response:
+            print(f"\033[91mFailed to receive a response from OpenAI-compatible endpoint ({API_BASE}). Verify your server or API key.\033[0m")
+            return False
+
+        if not ENABLE_STREAMING and response.get("content"):
+            print(f"\n\033[94mAntiCoding:\033[0m\n{response['content']}")
+
+        messages.append(response)
+        log_transcript_entry(response)
+        tool_calls = response.get("tool_calls")
+
+        if not tool_calls:
+            return True
+
+        for tc in tool_calls:
+            fn_name = tc.get("function", {}).get("name", "")
+            raw_args = tc.get("function", {}).get("arguments", "{}")
+            
+            try:
+                fn_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except json.JSONDecodeError as err:
+                tool_output = f"JSON Argument Error: {err}. Please provide valid JSON arguments."
+            else:
+                tool_output = execute_tool(fn_name, fn_args)
+
+            preview = tool_output[:300] + "..." if len(tool_output) > 300 else tool_output
+            print(f"\033[90mResult:\n{preview}\033[0m")
+
+            tool_msg = {
+                "role": "tool",
+                "tool_call_id": tc.get("id", "call_default"),
+                "content": tool_output
+            }
+            messages.append(tool_msg)
+            log_transcript_entry(tool_msg)
+
+    return True
+
+def parse_cli_args(argv: list = None):
+    """Parse CLI arguments for headless one-shot execution or custom runtime settings."""
+    parser = argparse.ArgumentParser(
+        prog="anticoding",
+        description="AntiCoding Agent - Zero-dependency AI Pair-Programmer for OpenAI-compatible APIs."
+    )
+    parser.add_argument("-p", "--prompt", type=str, help="Run a single prompt non-interactively and exit (supports piped stdin).")
+    parser.add_argument("-m", "--model", type=str, help="Override model name (ANTICODING_MODEL / OPENAI_MODEL).")
+    parser.add_argument("--api-base", type=str, help="Override OpenAI-compatible API base URL (ANTICODING_API_BASE / OPENAI_BASE_URL).")
+    parser.add_argument("--api-key", type=str, help="Override API key (ANTICODING_API_KEY / OPENAI_API_KEY).")
+    parser.add_argument("--ask", action="store_true", help="Prompt for confirmation before executing shell commands or file edits.")
+    parser.add_argument("--no-sandbox", action="store_true", help="Disable workspace path jail and command pattern filters.")
+    parser.add_argument("--no-stream", action="store_true", help="Disable SSE token streaming.")
+    parser.add_argument("-v", "--version", action="version", version=f"AntiCoding Agent v{VERSION}")
+    return parser.parse_args(argv)
+
+def run_agent(argv: list = None):
+    global API_BASE, API_KEY, MODEL_NAME, ASK_BEFORE_EXEC, ENABLE_SANDBOX, ENABLE_STREAMING
+
+    args = parse_cli_args(argv)
+    if args.api_base:
+        API_BASE = args.api_base.rstrip("/")
+    if args.api_key:
+        API_KEY = args.api_key
+    if args.model:
+        MODEL_NAME = args.model
+    if args.ask:
+        ASK_BEFORE_EXEC = True
+    if args.no_sandbox:
+        ENABLE_SANDBOX = False
+    if args.no_stream:
+        ENABLE_STREAMING = False
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    log_transcript_entry(messages[0])
+
+    # Headless One-Shot Mode (-p / --prompt, optionally with piped stdin)
+    if args.prompt:
+        piped_input = ""
+        if not sys.stdin.isatty():
+            try:
+                piped_input = sys.stdin.read().strip()
+            except Exception:
+                pass
+        full_prompt = f"{args.prompt}\n\n[Piped Stdin Context]:\n```\n{piped_input}\n```" if piped_input else args.prompt
+        ok = run_turn(full_prompt, messages)
+        sys.exit(0 if ok else 1)
+
     print("=" * 64)
-    print("\033[96m🚀 AntiCoding Agent (10/10 Tier Edition)\033[0m")
+    print(f"\033[96m🚀 AntiCoding Agent v{VERSION} (Zero-Dependency Edition)\033[0m")
     print(f"Backend    : {API_BASE} [{MODEL_NAME}]")
     print(f"Context Cap: {MAX_CONTEXT_TOKENS:,} tokens (Server ctx: {SERVER_CTX_SIZE:,})")
     print(f"Streaming  : {'Enabled (SSE)' if ENABLE_STREAMING else 'Disabled'}")
     print(f"Sandbox    : {'Enforced (Path Jail)' if ENABLE_SANDBOX else 'Disabled'}")
+    print(f"Approval   : {'Ask before exec (/mode ask)' if ASK_BEFORE_EXEC else 'Autonomous (/mode auto)'}")
     print(f"Workspace  : {CURRENT_WORKSPACE}")
     print(f"Transcript : {TRANSCRIPT_FILE}")
     print(f"Scratchpad : {SCRATCHPAD_PATH}")
     print("Type '/help' for commands, or 'exit' / 'quit' to stop.")
     print("=" * 64)
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    log_transcript_entry(messages[0])
-
     while True:
         try:
             ws_label = "main" if CURRENT_WORKSPACE == ROOT_WORKSPACE else os.path.basename(CURRENT_WORKSPACE)
-            user_input = input(f"\n\033[92m(anticoding [{ws_label}]) > \033[0m").strip()
+            mode_tag = ":ask" if ASK_BEFORE_EXEC else ""
+            user_input = input(f"\n\033[92m(anticoding [{ws_label}{mode_tag}]) > \033[0m").strip()
             if not user_input:
                 continue
 
@@ -1143,6 +1376,17 @@ def run_agent():
                 break
             elif cmd_name == "/help":
                 print_help()
+                continue
+            elif cmd_name == "/mode":
+                target_mode = cmd_arg.strip().lower()
+                if target_mode == "ask":
+                    ASK_BEFORE_EXEC = True
+                elif target_mode == "auto":
+                    ASK_BEFORE_EXEC = False
+                else:
+                    ASK_BEFORE_EXEC = not ASK_BEFORE_EXEC
+                state_str = "ask (prompt before shell/file edits)" if ASK_BEFORE_EXEC else "auto (autonomous execution)"
+                print(f"\033[92mApproval mode set to: {state_str}\033[0m")
                 continue
             elif cmd_name in ["/ws", "/workspace", "/workspaces"]:
                 ws_sub = cmd_arg.split(maxsplit=1)
@@ -1209,56 +1453,7 @@ def run_agent():
                 messages = compact_conversation(messages, max_tokens=0)
                 continue
 
-            # Take non-destructive git snapshot before executing turn
-            create_checkpoint(user_input)
-
-            user_msg = {"role": "user", "content": user_input}
-            messages.append(user_msg)
-            log_transcript_entry(user_msg)
-
-            # Agent reasoning & tool execution loop
-            step_count = 0
-            max_steps = 25
-
-            while step_count < max_steps:
-                step_count += 1
-                messages = compact_conversation(messages)
-
-                response = call_llm(messages)
-                if not response:
-                    print("\033[91mFailed to receive a response from local LLM. Please verify llama.service is running.\033[0m")
-                    break
-
-                messages.append(response)
-                log_transcript_entry(response)
-                tool_calls = response.get("tool_calls")
-
-                if not tool_calls:
-                    # Content is already streamed live in real time
-                    break
-
-                for tc in tool_calls:
-                    fn_name = tc.get("function", {}).get("name", "")
-                    raw_args = tc.get("function", {}).get("arguments", "{}")
-                    
-                    try:
-                        fn_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                    except json.JSONDecodeError as err:
-                        tool_output = f"JSON Argument Error: {err}. Please provide valid JSON arguments."
-                    else:
-                        tool_output = execute_tool(fn_name, fn_args)
-
-                    # Display preview snippet
-                    preview = tool_output[:300] + "..." if len(tool_output) > 300 else tool_output
-                    print(f"\033[90mResult:\n{preview}\033[0m")
-
-                    tool_msg = {
-                        "role": "tool",
-                        "tool_call_id": tc.get("id", "call_default"),
-                        "content": tool_output
-                    }
-                    messages.append(tool_msg)
-                    log_transcript_entry(tool_msg)
+            run_turn(user_input, messages)
 
         except (KeyboardInterrupt, EOFError):
             print("\nSession ended.")
