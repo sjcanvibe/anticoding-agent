@@ -1,5 +1,11 @@
 # 🚀 AntiCoding Agent
 
+[![CI](https://github.com/sjcanvibe/anticoding-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/sjcanvibe/anticoding-agent/actions/workflows/ci.yml)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](./LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
+[![Zero Dependencies](https://img.shields.io/badge/dependencies-0_(stdlib)-brightgreen.svg)](#-key-features)
+[![Version](https://img.shields.io/badge/version-2.1.0-informational.svg)](https://github.com/sjcanvibe/anticoding-agent)
+
 **AntiCoding Agent** is an autonomous, **zero-dependency** AI pair-programmer built with 100% Python 3 standard library. It connects to **any OpenAI-compatible Chat Completions API** (`/v1/chat/completions`) — from local **llama.cpp**, **Ollama**, and **vLLM** servers to cloud **OpenAI**, **DeepSeek**, and **OpenRouter** endpoints.
 
 ---
