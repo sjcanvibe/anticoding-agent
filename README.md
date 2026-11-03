@@ -139,4 +139,4 @@ cp .env.example .env
 
 ## 📄 License & Security
 
-Licensed under the [MIT License](./LICENSE). See [SECURITY.md](./SECURITY.md) for sandbox architecture and threat-model details.
+Licensed under the [GNU Affero General Public License v3.0 (AGPL-3.0)](./LICENSE). See [SECURITY.md](./SECURITY.md) for sandbox architecture and threat-model details.
