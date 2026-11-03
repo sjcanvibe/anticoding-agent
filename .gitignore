@@ -1,0 +1,25 @@
+# Python Bytecode & Packaging
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# AntiCoding Agent Local Runtime Artifacts
+.anticoding/
+
+# Environment Variables & Secrets
+.env
+.env.local
+*.env
+
+# OS & Editor Metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

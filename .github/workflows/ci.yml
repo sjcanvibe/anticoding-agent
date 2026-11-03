@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile bytecode & verify syntax
+        run: python3 -m py_compile anticoding_agent.py
+
+      - name: Run sandbox, dotenv, and repo-map self-tests
+        run: |
+          python3 -c '
+          import anticoding_agent as agent
+          safe, _, _ = agent.is_safe_path("README.md")
+          assert safe, "Relative workspace file should be permitted"
+          unsafe, _, _ = agent.is_safe_path("../../etc/passwd")
+          assert not unsafe, "Directory traversal must be blocked"
+          cmd_ok, _ = agent.is_safe_command("ls -la")
+          assert cmd_ok, "Benign command should be permitted"
+          cmd_bad, _ = agent.is_safe_command("sudo rm -rf /")
+          assert not cmd_bad, "Privileged destructive command must be blocked"
+          rmap = agent.generate_repo_map()
+          assert "def run_agent" in rmap, "Repo map must extract top-level symbols"
+          print("All self-tests passed!")
+          '
