@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """
 AntiCoding Agent - Autonomous AI Pair-Programmer for OpenAI-Compatible APIs
 Zero external dependencies required (100% Python 3 standard library).
