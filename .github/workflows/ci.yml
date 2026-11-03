@@ -36,6 +36,8 @@ jobs:
           assert cmd_ok, "Benign command should be permitted"
           cmd_bad, _ = agent.is_safe_command("sudo rm -rf /")
           assert not cmd_bad, "Privileged destructive command must be blocked"
+          cmd_bad2, _ = agent.is_safe_command("rm -r -f /")
+          assert not cmd_bad2, "Multi-flag root deletion must be blocked"
           rmap = agent.generate_repo_map()
           assert "def run_agent" in rmap, "Repo map must extract top-level symbols"
           cleaned, tcs = agent.extract_fallback_tool_calls(" Thinking... <tool_call>{\"name\": \"list_dir\", \"arguments\": {\"path\": \".\"}}</tool_call>")
