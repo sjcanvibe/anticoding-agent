@@ -58,7 +58,9 @@ def load_dotenv(dotenv_path: str = ".env"):
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
-                k = k.strip().removeprefix("export ").strip()
+                k = k.strip()
+                if k.startswith("export "):
+                    k = k[7:].strip()
                 v = v.strip().strip("'").strip('"')
                 os.environ.setdefault(k, v)
     except Exception:
@@ -341,16 +343,21 @@ def create_checkpoint(label: str = "", workspace: str = None) -> str:
         return None
     try:
         os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        timestamp = f"{time.strftime('%Y%m%d_%H%M%S')}_{int((time.time() % 1) * 1000):03d}"
         clean_label = re.sub(r'[^a-zA-Z0-9_-]', '_', label).strip('_')[:25] or "step"
-        ws_tag = "root" if target_ws == ROOT_WORKSPACE else os.path.basename(target_ws)
+        ws_tag = "root" if os.path.abspath(target_ws) == os.path.abspath(ROOT_WORKSPACE) else os.path.basename(target_ws)
         patch_file = os.path.join(CHECKPOINTS_DIR, f"cp_{timestamp}_{ws_tag}_{clean_label}.patch")
 
         head_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=target_ws, capture_output=True, text=True, timeout=5).stdout.strip()
+        untracked_res = subprocess.run(["git", "ls-files", "--others", "--exclude-standard"], cwd=target_ws, capture_output=True, text=True, timeout=5)
+        pre_untracked = [
+            u for u in untracked_res.stdout.splitlines()
+            if u and not u.startswith(".anticoding/") and u != ".anticoding"
+        ]
         diff_res = subprocess.run(["git", "diff", "HEAD"], cwd=target_ws, capture_output=True, text=True, timeout=10)
         
         with open(patch_file, "w", encoding="utf-8") as f:
-            f.write(f"# GIT_COMMIT: {head_commit}\n# TIMESTAMP: {timestamp}\n# WORKSPACE: {target_ws}\n# LABEL: {label}\n")
+            f.write(f"# GIT_COMMIT: {head_commit}\n# TIMESTAMP: {timestamp}\n# WORKSPACE: {target_ws}\n# LABEL: {label}\n# UNTRACKED: {json.dumps(pre_untracked)}\n")
             f.write(diff_res.stdout)
             
         return patch_file
@@ -365,20 +372,43 @@ def rollback_checkpoint(workspace: str = None) -> str:
     try:
         if not os.path.exists(CHECKPOINTS_DIR):
             return "No checkpoints found."
-        patches = sorted([p for p in os.listdir(CHECKPOINTS_DIR) if p.endswith(".patch")])
+        ws_tag = "root" if os.path.abspath(target_ws) == os.path.abspath(ROOT_WORKSPACE) else os.path.basename(target_ws)
+        patches = sorted([p for p in os.listdir(CHECKPOINTS_DIR) if p.endswith(".patch") and f"_{ws_tag}_" in p])
         if not patches:
-            return "No checkpoints available to rollback."
+            return f"No checkpoints available to rollback for workspace '{ws_tag}'."
         
         latest_patch = patches[-1]
         patch_path = os.path.join(CHECKPOINTS_DIR, latest_patch)
-        
-        # 1. Reset working tree to clean HEAD
-        subprocess.run(["git", "checkout", "."], cwd=target_ws, capture_output=True, text=True, timeout=10)
-        subprocess.run(["git", "clean", "-fd"], cwd=target_ws, capture_output=True, text=True, timeout=10)
-        
-        # 2. Re-apply the diff patch captured at the start of the turn (if non-empty)
+
+        pre_untracked = set()
+        patch_lines = []
         with open(patch_path, "r", encoding="utf-8") as f:
-            patch_lines = [line for line in f if not line.startswith("# ")]
+            for line in f:
+                if line.startswith("# UNTRACKED: "):
+                    try:
+                        pre_untracked = set(json.loads(line[len("# UNTRACKED: "):].strip()))
+                    except Exception:
+                        pass
+                elif not line.startswith("# "):
+                    patch_lines.append(line)
+        
+        # 1. Reset tracked files in working tree to clean HEAD
+        subprocess.run(["git", "checkout", "--", "."], cwd=target_ws, capture_output=True, text=True, timeout=10)
+        
+        # 2. Remove only newly created untracked files (preserving pre-existing untracked files and .anticoding/)
+        untracked_res = subprocess.run(["git", "ls-files", "--others", "--exclude-standard"], cwd=target_ws, capture_output=True, text=True, timeout=5)
+        for rel_u in untracked_res.stdout.splitlines():
+            if not rel_u or rel_u.startswith(".anticoding/") or rel_u == ".anticoding":
+                continue
+            if rel_u not in pre_untracked:
+                full_u = os.path.join(target_ws, rel_u)
+                try:
+                    if os.path.isfile(full_u) or os.path.islink(full_u):
+                        os.remove(full_u)
+                except Exception:
+                    pass
+        
+        # 3. Re-apply the diff patch captured at the start of the turn (if non-empty)
         patch_body = "".join(patch_lines)
         if patch_body.strip():
             subprocess.run(
@@ -391,21 +421,23 @@ def rollback_checkpoint(workspace: str = None) -> str:
             )
         
         os.remove(patch_path)
+        invalidate_repo_map_cache()
         return f"Successfully restored workspace ({target_ws}) to checkpoint '{latest_patch}'."
     except Exception as e:
         return f"Rollback Error: {str(e)}"
 
 def list_checkpoints(workspace: str = None) -> str:
-    """List available git checkpoints."""
+    """List available git checkpoints for the active workspace."""
     target_ws = workspace or CURRENT_WORKSPACE
     if not is_git_repo(target_ws):
         return "Not a git repository."
     if not os.path.exists(CHECKPOINTS_DIR):
         return "No checkpoints saved yet."
-    patches = sorted([p for p in os.listdir(CHECKPOINTS_DIR) if p.endswith(".patch")])
+    ws_tag = "root" if os.path.abspath(target_ws) == os.path.abspath(ROOT_WORKSPACE) else os.path.basename(target_ws)
+    patches = sorted([p for p in os.listdir(CHECKPOINTS_DIR) if p.endswith(".patch") and f"_{ws_tag}_" in p])
     if not patches:
-        return "No checkpoints saved yet."
-    return "Saved Checkpoints (newest last):\n" + "\n".join(f"  • {p}" for p in patches[-10:])
+        return f"No checkpoints saved yet for workspace '{ws_tag}'."
+    return f"Saved Checkpoints for '{ws_tag}' (newest last):\n" + "\n".join(f"  • {p}" for p in patches[-10:])
 
 # ----------------- Sandboxing & Workspaces Engine -----------------
 
@@ -445,7 +477,7 @@ def is_safe_command(command: str) -> tuple:
     
     dangerous_patterns = [
         (r'\bsudo\b', "Use of 'sudo' is blocked in sandbox mode."),
-        (r'\brm\s+-[a-zA-Z]*[rfRF][a-zA-Z]*\s+(/|/\*|~|\$HOME|\.\.)(?:\s|$|;)', "Destructive root/home/parent deletion blocked."),
+        (r'\brm\b(?:\s+-[a-zA-Z0-9-]+)*\s+(/|/\*|~|\$HOME|\.\.)(?:\s|$|;|&|\|)', "Destructive root/home/parent deletion blocked."),
         (r'\bmkfs\b', "Filesystem formatting blocked."),
         (r'\bfdisk\b', "Disk partitioning blocked."),
         (r'\bdd\s+if=', "Low-level disk writing blocked."),
@@ -614,6 +646,7 @@ def tool_run_command(command: str) -> str:
         return "Command execution cancelled by user."
     try:
         res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120, cwd=CURRENT_WORKSPACE)
+        invalidate_repo_map_cache()
         output = res.stdout + res.stderr
         if not output.strip():
             output = "(Command executed successfully with no output)"
@@ -685,6 +718,7 @@ def tool_replace_file_content(path: str, target: str, replacement: str) -> str:
 
         with open(path, "w", encoding="utf-8") as f:
             f.write(new_content)
+        invalidate_repo_map_cache()
 
         return f"Successfully updated '{path}'."
     except Exception as e:
@@ -705,9 +739,10 @@ def tool_write_file(path: str, content: str) -> str:
         if not confirm_action(f"Write {len(content)} chars to '{os.path.basename(path)}'?"):
             return "File write cancelled by user."
 
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
+        invalidate_repo_map_cache()
         return f"Successfully wrote {len(content)} characters to '{path}'."
     except Exception as e:
         return f"Write File Error: {str(e)}"
@@ -973,7 +1008,7 @@ def compact_conversation(messages: list, max_tokens: int = MAX_CONTEXT_TOKENS) -
     root_user_goal = messages[1] if len(messages) > 1 and messages[1].get("role") == "user" else None
 
     cutoff_idx = max(2 if root_user_goal else 1, len(messages) - RECENT_MESSAGES_TO_KEEP)
-    while cutoff_idx < len(messages) and messages[cutoff_idx].get("role") != "user":
+    while cutoff_idx < len(messages) and messages[cutoff_idx].get("role") == "tool":
         cutoff_idx += 1
 
     start_idx = 2 if root_user_goal else 1
@@ -994,20 +1029,23 @@ def compact_conversation(messages: list, max_tokens: int = MAX_CONTEXT_TOKENS) -
     else:
         summary_text = "Prior dialogue compacted to conserve context tokens."
 
-    compacted = [system_msg]
-    if root_user_goal:
-        compacted.append(root_user_goal)
-
-    compacted.extend([
-        {"role": "user", "content": f"[Previous Session History Compacted]:\n{summary_text}"},
-        {"role": "assistant", "content": "Understood. Continuing from current state with this context."},
-        *recent_msgs
-    ])
+    root_text = f"{root_user_goal.get('content', '')}\n\n" if root_user_goal else ""
+    compacted = [
+        system_msg,
+        {"role": "user", "content": f"{root_text}[Previous Session History Compacted]:\n{summary_text}"}
+    ]
+    if not recent_msgs or recent_msgs[0].get("role") == "user":
+        compacted.append({"role": "assistant", "content": "Understood. Continuing from current state with this context."})
+    compacted.extend(recent_msgs)
 
     print(f"\033[92m[Context Manager] Compaction complete (~{estimate_tokens(compacted)} tokens, preserved {len(recent_msgs)} recent messages).\033[0m")
     return compacted
 
 _REPO_MAP_CACHE = {"workspace": "", "mtime": 0, "content": ""}
+
+def invalidate_repo_map_cache():
+    """Invalidate the cached repository symbol map after file mutations or command runs."""
+    _REPO_MAP_CACHE["mtime"] = 0
 
 def generate_repo_map(root_dir=None) -> str:
     """Zero-dependency lightweight AST/repo map generator using Regex with depth limits and mtime caching."""
