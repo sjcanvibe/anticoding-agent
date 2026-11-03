@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "anticoding-agent"
-version = "2.0.0"
-description = "Zero-dependency local AI pair-programmer with SSE streaming, Git worktree isolation, and hybrid memory."
+version = "2.1.0"
+description = "Zero-dependency AI pair-programmer for OpenAI-compatible APIs with SSE streaming, Git worktree isolation, and hybrid memory."
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}

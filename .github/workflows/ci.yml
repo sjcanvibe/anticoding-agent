@@ -24,9 +24,9 @@ jobs:
       - name: Compile bytecode & verify syntax
         run: python3 -m py_compile anticoding_agent.py
 
-      - name: Run sandbox, dotenv, and repo-map self-tests
+      - name: Run sandbox, dotenv, fallback parser, CLI, and checkpoint self-tests
         run: |
-          python3 -c '
+          python3 -B -c '
           import anticoding_agent as agent
           safe, _, _ = agent.is_safe_path("README.md")
           assert safe, "Relative workspace file should be permitted"
@@ -38,5 +38,9 @@ jobs:
           assert not cmd_bad, "Privileged destructive command must be blocked"
           rmap = agent.generate_repo_map()
           assert "def run_agent" in rmap, "Repo map must extract top-level symbols"
+          cleaned, tcs = agent.extract_fallback_tool_calls(" Thinking... <tool_call>{\"name\": \"list_dir\", \"arguments\": {\"path\": \".\"}}</tool_call>")
+          assert len(tcs) == 1 and tcs[0]["function"]["name"] == "list_dir", "Fallback tool_call parser failed"
+          cli_args = agent.parse_cli_args(["-p", "test prompt", "--model", "gpt-4.1", "--ask"])
+          assert cli_args.prompt == "test prompt" and cli_args.model == "gpt-4.1" and cli_args.ask is True
           print("All self-tests passed!")
           '
